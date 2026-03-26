@@ -168,6 +168,10 @@ GitHub Actions workflow: [`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd
 └── README.md
 ```
 
+## Future improvements
+
+- **gRPC API** — The HTTP surface stays ideal for curl, browsers, and typical ingress. A **gRPC** service would suit internal callers: typed request/response messages (for example HTML or XML as `bytes` and PDF as `bytes`), HTTP/2, and standard metadata for auth and tracing. Unary RPCs could match today’s model; streaming could help if much larger payloads are allowed later. Keeping HTTP while adding gRPC (or exposing HTTP via grpc-gateway) would be additive rather than replacing the current API.
+
 ## License
 
 Add a `LICENSE` file if you intend to open-source this repository.
