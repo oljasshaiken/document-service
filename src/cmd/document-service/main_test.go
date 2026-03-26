@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -31,12 +32,12 @@ func TestHTMLToPDFHandler_EmptyHTML(t *testing.T) {
 }
 
 func TestHTMLToPDFHandler_PDFGenerationError(t *testing.T) {
-	origGenerator := pdfGenerator
-	pdfGenerator = func(string) ([]byte, error) {
+	origGenerator := pdfGen
+	pdfGen = func(context.Context, string) ([]byte, error) {
 		return nil, errors.New("boom")
 	}
 	t.Cleanup(func() {
-		pdfGenerator = origGenerator
+		pdfGen = origGenerator
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/html-to-pdf", strings.NewReader("<h1>hi</h1>"))
@@ -51,15 +52,15 @@ func TestHTMLToPDFHandler_PDFGenerationError(t *testing.T) {
 
 func TestHTMLToPDFHandler_Success(t *testing.T) {
 	const fakePDF = "%PDF-1.7 fake"
-	origGenerator := pdfGenerator
-	pdfGenerator = func(html string) ([]byte, error) {
+	origGenerator := pdfGen
+	pdfGen = func(_ context.Context, html string) ([]byte, error) {
 		if html == "" {
 			t.Fatal("expected non-empty html")
 		}
 		return []byte(fakePDF), nil
 	}
 	t.Cleanup(func() {
-		pdfGenerator = origGenerator
+		pdfGen = origGenerator
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/html-to-pdf", strings.NewReader("<p>Hello</p>"))
@@ -82,13 +83,13 @@ func TestHTMLToPDFHandler_Success(t *testing.T) {
 }
 
 func TestHTMLToPDFHandler_ReadBodyError(t *testing.T) {
-	origGenerator := pdfGenerator
-	pdfGenerator = func(string) ([]byte, error) {
+	origGenerator := pdfGen
+	pdfGen = func(context.Context, string) ([]byte, error) {
 		t.Fatal("pdf generator should not be called for body read error")
 		return nil, nil
 	}
 	t.Cleanup(func() {
-		pdfGenerator = origGenerator
+		pdfGen = origGenerator
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/html-to-pdf", errReader{})
@@ -102,16 +103,16 @@ func TestHTMLToPDFHandler_ReadBodyError(t *testing.T) {
 }
 
 func TestHTMLToPDFHandler_BodyTooLarge(t *testing.T) {
-	origGenerator := pdfGenerator
-	pdfGenerator = func(string) ([]byte, error) {
+	origGenerator := pdfGen
+	pdfGen = func(context.Context, string) ([]byte, error) {
 		t.Fatal("pdf generator should not be called for oversized request")
 		return nil, nil
 	}
 	t.Cleanup(func() {
-		pdfGenerator = origGenerator
+		pdfGen = origGenerator
 	})
 
-	tooLarge := strings.Repeat("a", maxHTMLBodySize+1)
+	tooLarge := strings.Repeat("a", int(appCfg.MaxBodyBytes)+1)
 	req := httptest.NewRequest(http.MethodPost, "/html-to-pdf", strings.NewReader(tooLarge))
 	rr := httptest.NewRecorder()
 
@@ -137,7 +138,7 @@ func TestHealthHandler(t *testing.T) {
 }
 
 func TestNewServer_Routes(t *testing.T) {
-	srv := newServer()
+	srv := newServer(appCfg)
 
 	healthReq := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	healthRR := httptest.NewRecorder()
@@ -146,11 +147,52 @@ func TestNewServer_Routes(t *testing.T) {
 		t.Fatalf("expected health route status %d, got %d", http.StatusOK, healthRR.Code)
 	}
 
+	metricsReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	metricsRR := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(metricsRR, metricsReq)
+	if metricsRR.Code != http.StatusOK {
+		t.Fatalf("expected metrics route status %d, got %d", http.StatusOK, metricsRR.Code)
+	}
+
 	notFoundReq := httptest.NewRequest(http.MethodGet, "/not-found", nil)
 	notFoundRR := httptest.NewRecorder()
 	srv.Handler.ServeHTTP(notFoundRR, notFoundReq)
 	if notFoundRR.Code != http.StatusNotFound {
 		t.Fatalf("expected not found status %d, got %d", http.StatusNotFound, notFoundRR.Code)
+	}
+}
+
+func TestAPIKeyAuth_Unauthorized(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.APIKeys = map[string]struct{}{"secret": {}}
+	srv := newServer(cfg)
+
+	req := httptest.NewRequest(http.MethodPost, "/html-to-pdf", strings.NewReader("<p>x</p>"))
+	rr := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected status %d, got %d", http.StatusUnauthorized, rr.Code)
+	}
+}
+
+func TestAPIKeyAuth_OK(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.APIKeys = map[string]struct{}{"secret": {}}
+	srv := newServer(cfg)
+	origGen := pdfGen
+	pdfGen = func(context.Context, string) ([]byte, error) {
+		return []byte("%PDF"), nil
+	}
+	t.Cleanup(func() {
+		pdfGen = origGen
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/html-to-pdf", strings.NewReader("<p>x</p>"))
+	req.Header.Set("X-API-Key", "secret")
+	rr := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rr.Code)
 	}
 }
 
@@ -178,8 +220,8 @@ func TestXMLToPDFHandler_InvalidXML(t *testing.T) {
 
 func TestXMLToPDFHandler_Success(t *testing.T) {
 	const fakePDF = "%PDF-1.7 fake"
-	origGenerator := pdfGenerator
-	pdfGenerator = func(content string) ([]byte, error) {
+	origGenerator := pdfGen
+	pdfGen = func(_ context.Context, content string) ([]byte, error) {
 		if !strings.Contains(content, "<pre>") {
 			t.Fatal("expected XML content wrapped in pre tag")
 		}
@@ -189,7 +231,7 @@ func TestXMLToPDFHandler_Success(t *testing.T) {
 		return []byte(fakePDF), nil
 	}
 	t.Cleanup(func() {
-		pdfGenerator = origGenerator
+		pdfGen = origGenerator
 	})
 
 	xmlBody := `<note><to>Tove</to><from>Jani</from><body>Hello</body></note>`

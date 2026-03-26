@@ -20,8 +20,12 @@ RUN apk add --no-cache \
 
 ENV CHROME_PATH=/usr/bin/chromium
 
-WORKDIR /app
-COPY --from=builder /bin/document-service /usr/local/bin/document-service
+RUN adduser -D -u 65532 appuser
+
+WORKDIR /tmp
+COPY --from=builder --chown=65532:65532 /bin/document-service /usr/local/bin/document-service
+
+USER appuser
 
 EXPOSE 8080
 
