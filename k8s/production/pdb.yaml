@@ -1,0 +1,10 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: document-service
+  namespace: document-service
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: document-service

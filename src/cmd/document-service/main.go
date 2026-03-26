@@ -7,45 +7,104 @@ import (
 	"fmt"
 	"html"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
-	"net/url"
 	"os"
-	"os/exec"
+	"os/signal"
 	"strings"
-	"time"
-
-	"github.com/chromedp/cdproto/page"
-	"github.com/chromedp/chromedp"
+	"syscall"
 )
 
-const (
-	serverAddr      = ":8080"
-	maxHTMLBodySize = 2 << 20 // 2 MiB
-	pdfTimeout      = 30 * time.Second
+var (
+	appCfg = defaultConfig()
+	// pdfGen renders HTML to PDF; overridden in tests.
+	pdfGen = func(ctx context.Context, html string) ([]byte, error) {
+		return generatePDF(ctx, appCfg, html)
+	}
+	renderSem chan struct{}
 )
 
-var pdfGenerator = generatePDF
-
-func main() {
-	server := newServer()
-	log.Printf("Server starting on %s...", server.Addr)
-	log.Fatal(server.ListenAndServe())
+func init() {
+	initConcurrency(appCfg.MaxConcurrentRenders)
 }
 
-func newServer() *http.Server {
+func initConcurrency(n int) {
+	if n < 1 {
+		n = 1
+	}
+	renderSem = make(chan struct{}, n)
+}
+
+func main() {
+	cfg, err := loadConfig()
+	if err != nil {
+		slog.Error("config error", "err", err)
+		os.Exit(1)
+	}
+	appCfg = cfg
+	initConcurrency(cfg.MaxConcurrentRenders)
+
+	var logHandler slog.Handler
+	if cfg.LogJSON {
+		logHandler = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
+	} else {
+		logHandler = slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
+	}
+	slog.SetDefault(slog.New(logHandler))
+
+	srv := newServer(cfg)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		slog.Info("server listening", "addr", cfg.Addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("server error", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	<-ctx.Done()
+	slog.Info("shutting down")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Error("shutdown error", "err", err)
+		os.Exit(1)
+	}
+	slog.Info("shutdown complete")
+}
+
+func newServer(cfg *Config) *http.Server {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/html-to-pdf", htmlToPDFHandler)
-	mux.HandleFunc("/xml-to-pdf", xmlToPDFHandler)
 	mux.HandleFunc("/healthz", healthHandler)
+	mux.Handle("/metrics", metricsHandler())
+
+	htmlChain := http.Handler(http.HandlerFunc(htmlToPDFHandler))
+	xmlChain := http.Handler(http.HandlerFunc(xmlToPDFHandler))
+
+	if cfg.RateLimitRPS > 0 {
+		il := newIPLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
+		htmlChain = rateLimitMiddleware(il, htmlChain)
+		xmlChain = rateLimitMiddleware(il, xmlChain)
+	}
+	htmlChain = apiKeyAuth(cfg, htmlChain)
+	xmlChain = apiKeyAuth(cfg, xmlChain)
+	htmlChain = instrumentHandler("html_to_pdf", htmlChain)
+	xmlChain = instrumentHandler("xml_to_pdf", xmlChain)
+
+	mux.Handle("/html-to-pdf", htmlChain)
+	mux.Handle("/xml-to-pdf", xmlChain)
 
 	return &http.Server{
-		Addr:              serverAddr,
+		Addr:              cfg.Addr,
 		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       120 * time.Second,
+		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
+		ReadTimeout:       cfg.ReadTimeout,
+		WriteTimeout:      cfg.WriteTimeout,
+		IdleTimeout:       cfg.IdleTimeout,
 	}
 }
 
@@ -69,8 +128,18 @@ func handleDocumentToPDF(w http.ResponseWriter, r *http.Request, format string) 
 		return
 	}
 
+	if err := acquireRender(r.Context()); err != nil {
+		if errors.Is(err, context.Canceled) {
+			http.Error(w, "client disconnected", http.StatusRequestTimeout)
+			return
+		}
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	defer releaseRender()
+
 	defer r.Body.Close()
-	r.Body = http.MaxBytesReader(w, r.Body, maxHTMLBodySize)
+	r.Body = http.MaxBytesReader(w, r.Body, appCfg.MaxBodyBytes)
 
 	htmlBytes, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -95,9 +164,13 @@ func handleDocumentToPDF(w http.ResponseWriter, r *http.Request, format string) 
 		return
 	}
 
-	pdfBytes, err := pdfGenerator(pdfSource)
+	pdfBytes, err := pdfGen(r.Context(), pdfSource)
 	if err != nil {
-		log.Printf("PDF generation error: %v", err)
+		if errors.Is(err, context.Canceled) {
+			http.Error(w, "client disconnected", http.StatusRequestTimeout)
+			return
+		}
+		slog.Error("pdf generation error", "err", err)
 		http.Error(w, "failed to generate PDF", http.StatusInternalServerError)
 		return
 	}
@@ -106,6 +179,19 @@ func handleDocumentToPDF(w http.ResponseWriter, r *http.Request, format string) 
 	w.Header().Set("Content-Disposition", `attachment; filename="document.pdf"`)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(pdfBytes)
+}
+
+func acquireRender(ctx context.Context) error {
+	select {
+	case renderSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func releaseRender() {
+	<-renderSem
 }
 
 func toPDFSource(content, format string) (string, error) {
@@ -126,85 +212,16 @@ func toPDFSource(content, format string) (string, error) {
 }
 
 func validateXML(content string) error {
-	decoder := xml.NewDecoder(strings.NewReader(content))
+	dec := xml.NewDecoder(strings.NewReader(content))
+	dec.Strict = true
 	for {
-		_, err := decoder.Token()
+		t, err := dec.Token()
 		if err == io.EOF {
 			return nil
 		}
 		if err != nil {
 			return err
 		}
+		_ = t
 	}
-}
-
-// generatePDF converts HTML string to PDF bytes using chromedp
-func generatePDF(html string) ([]byte, error) {
-	chromePath, err := findChromePath()
-	if err != nil {
-		return nil, err
-	}
-
-	allocOpts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.ExecPath(chromePath),
-		chromedp.NoDefaultBrowserCheck,
-		chromedp.Flag("headless", true),
-		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("no-sandbox", true),
-		chromedp.Flag("disable-dev-shm-usage", true),
-	)
-
-	allocCtx, cancel := chromedp.NewExecAllocator(context.Background(), allocOpts...)
-	defer cancel()
-
-	ctx, cancel := chromedp.NewContext(allocCtx)
-	defer cancel()
-
-	ctx, cancel = context.WithTimeout(ctx, pdfTimeout)
-	defer cancel()
-
-	var pdfBytes []byte
-
-	err = chromedp.Run(ctx,
-		// URL-escape HTML to make data URL robust for special characters.
-		chromedp.Navigate("data:text/html;charset=utf-8,"+url.PathEscape(html)),
-		chromedp.WaitReady("body"), // wait until body is rendered
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			var err error
-			pdfBytes, _, err = page.PrintToPDF().
-				WithPrintBackground(true). // respect background colors
-				WithMarginTop(0.4).        // cm
-				WithMarginBottom(0.4).
-				WithMarginLeft(0.4).
-				WithMarginRight(0.4).
-				WithPaperWidth(8.27).   // A4 width in inches
-				WithPaperHeight(11.69). // A4 height
-				Do(ctx)
-			return err
-		}),
-	)
-
-	return pdfBytes, err
-}
-
-func findChromePath() (string, error) {
-	if p := os.Getenv("CHROME_PATH"); p != "" {
-		return p, nil
-	}
-
-	candidates := []string{
-		"chromium-browser",
-		"chromium",
-		"google-chrome",
-		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-	}
-
-	for _, name := range candidates {
-		p, err := exec.LookPath(name)
-		if err == nil {
-			return p, nil
-		}
-	}
-
-	return "", fmt.Errorf("chrome executable not found; set CHROME_PATH")
 }
