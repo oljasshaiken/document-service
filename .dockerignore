@@ -1,0 +1,8 @@
+.git
+.DS_Store
+.gomodcache
+.gocache
+main
+pdf-service
+out.pdf
+*.log

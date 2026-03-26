@@ -1,6 +1,9 @@
+# OS/editor artifacts
+.DS_Store
+
 # If you prefer the allow list template instead of the deny list, see community template:
 # https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
-#
+
 # Binaries for programs and plugins
 *.exe
 *.exe~
@@ -24,9 +27,22 @@ profile.cov
 go.work
 go.work.sum
 
-# env file
+# Environment files
 .env
+.env.*
 
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Build outputs (repo root only — avoid ignoring src/cmd/document-service/)
+/main
+/document-service
+src/cmd/document-service/document-service
+
+# Generated docs/files
+*.pdf
+
+# Go local caches (kept inside repo for local sandbox runs)
+.gocache/
+.gomodcache/
